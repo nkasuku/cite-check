@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+.DS_Store
+*.swp
+build/
+dist/
+.coverage
+.pytest_cache/
+
+# Local cache and outputs (not part of the repo)
+cache/
+out/
+*.docx
