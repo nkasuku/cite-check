@@ -1208,6 +1208,322 @@ def cmd_build(args: argparse.Namespace) -> int:
     return 0
 
 
+# --- subcommand: pressure-test ----------------------------------------------
+#
+# Pressure-test mode is the inverse of build:
+#   build      — agent assembles a Citation Card from scratch
+#   pressure-test — agent has ALREADY done a review and wants to validate that
+#                   each flagged risk is actually backed by (a) verbatim legal
+#                   text from a public source, (b) verbatim product facts from
+#                   the issue, and (c) sources that are publicly citable
+#                   under the product-counsel agent's "public sources only"
+#                   constraint (so internal-only refs are flagged).
+#
+# Input is a small JSON spec the agent assembles by reading its own in-session
+# review output. Schema:
+#
+#   {
+#     "review_target": "github/product-and-privacy-legal#2398",
+#     "review_summary": "<optional one-line summary of the review>",
+#     "risks": [
+#       {
+#         "id": "2.1",
+#         "label": "Cross-border data transfers",
+#         "tier": "medium",
+#         "claim": "<the risk statement from the review>",
+#         "asserted_legal_sources": [
+#           {"label": "GDPR Art. 46", "ref": "03-reg-gdpr.md#Article 46",
+#            "quote": "<verbatim text the review relies on, OPTIONAL>"}
+#         ],
+#         "asserted_product_facts": [
+#           {"label": "kayreiman comment", "ref": "owner/repo#N::comment_<id>",
+#            "quote": "<verbatim quote the review relies on>"}
+#         ]
+#       }
+#     ]
+#   }
+#
+# A source is allowed as a primary citation only if its classification is one
+# of {public-law, public-guidance, github-public, verify-required}.
+# `github-internal` refs (02-internal-* and 07-process-* and any unknown
+# repo-internal source) are downgraded to "background only" with a ⚠ flag.
+
+_PUBLIC_PRIMARY_CLASSES = {"public-law", "public-guidance", "github-public", "verify-required"}
+
+
+def _classify_ref_for_pressure_test(ref: str) -> str:
+    """Return the classification cite-check would assign to this ref, for
+    the public-source policy check. Mirrors the dispatcher used by
+    _resolve_source_text but doesn't fetch — it just tells us the class."""
+    ref = ref.strip()
+    if ref.startswith(("http://", "https://")):
+        return "verify-required"
+    if _COMMENT_REF_RE.match(ref):
+        return "github-public"
+    filename = ref.split("#", 1)[0].strip() if "#" in ref else ref
+    return _classification_for(filename)
+
+
+def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
+    """Resolve one source ref and (optionally) verify a quote against it.
+
+    Returns a dict with: ref, classification, source_url, resolved (bool),
+    error (if any), quote_provided (bool), quote_verified (bool|None).
+    Catches *any* exception from the dispatcher so a single bad ref never
+    crashes the whole pressure-test run.
+    """
+    out: dict[str, Any] = {
+        "ref": ref,
+        "classification": _classify_ref_for_pressure_test(ref),
+        "source_url": None,
+        "resolved": False,
+        "error": None,
+        "quote_provided": bool(quote and quote.strip()),
+        "quote_verified": None,
+    }
+    try:
+        source = _resolve_source_text(ref)
+    except Exception as e:  # noqa: BLE001 — pressure-test must never crash on a bad ref
+        out["error"] = f"{type(e).__name__}: {e}"
+        # Heuristic: a github.com URL that returns 404 unauthenticated almost
+        # always means a private/internal GitHub resource. Surface that so the
+        # public-source check can downgrade it to "background only".
+        msg = str(e).lower()
+        if ref.startswith("https://github.com/") and ("404" in msg or "not found" in msg):
+            out["classification"] = "github-internal"
+            out["error"] = (
+                f"{type(e).__name__}: not reachable unauthenticated — likely "
+                f"a private or internal GitHub resource"
+            )
+        return out
+    out["resolved"] = True
+    out["source_url"] = source["source_url"]
+    out["classification"] = source["classification"]
+    if quote and quote.strip():
+        haystack = source["text"]
+        out["quote_verified"] = _normalize_for_match(quote) in _normalize_for_match(haystack)
+    return out
+
+
+def _pressure_test_one_risk(risk: dict[str, Any]) -> dict[str, Any]:
+    legal = risk.get("asserted_legal_sources") or []
+    facts = risk.get("asserted_product_facts") or []
+
+    legal_results = [_check_one_quote(r.get("ref", ""), r.get("quote")) for r in legal]
+    fact_results = [_check_one_quote(r.get("ref", ""), r.get("quote")) for r in facts]
+
+    # Compute per-dimension status
+    legal_status, legal_notes = _grade_dimension(
+        legal_results,
+        legal,
+        category="legal",
+        require_verified_quote=True,
+    )
+    fact_status, fact_notes = _grade_dimension(
+        fact_results,
+        facts,
+        category="fact",
+        require_verified_quote=True,
+    )
+    public_status, public_notes = _grade_public_sources(legal_results + fact_results, legal, facts)
+
+    overall = "PASS"
+    if legal_status == "fail" or fact_status == "fail":
+        overall = "FAIL"
+    elif legal_status == "warn" or fact_status == "warn" or public_status == "warn":
+        overall = "WARN"
+
+    return {
+        "id": risk.get("id"),
+        "label": risk.get("label"),
+        "tier": risk.get("tier"),
+        "claim": risk.get("claim"),
+        "overall": overall,
+        "legal": {"status": legal_status, "notes": legal_notes, "results": legal_results},
+        "fact": {"status": fact_status, "notes": fact_notes, "results": fact_results},
+        "public_sources": {"status": public_status, "notes": public_notes},
+    }
+
+
+def _grade_dimension(
+    results: list[dict[str, Any]],
+    spec: list[dict[str, Any]],
+    *,
+    category: str,
+    require_verified_quote: bool,
+) -> tuple[str, list[str]]:
+    """Return (status, notes) for the legal or fact dimension.
+
+    status ∈ {"pass", "warn", "fail"}.
+    """
+    notes: list[str] = []
+    if not spec:
+        notes.append(f"no {category} sources cited in the review")
+        return "fail", notes
+
+    has_unresolved = False
+    has_unverified = False
+    has_no_quote = False
+    for r, s in zip(results, spec):
+        label = s.get("label") or r["ref"]
+        if not r["resolved"]:
+            has_unresolved = True
+            notes.append(f"✗ {label} — could not resolve ref `{r['ref']}` ({r['error']})")
+            continue
+        if not r["quote_provided"]:
+            if require_verified_quote:
+                has_no_quote = True
+                notes.append(
+                    f"⚠ {label} — ref resolves but no verbatim quote provided; "
+                    f"the reviewer is relying on the source generically"
+                )
+            else:
+                notes.append(f"✓ {label} — ref resolves at {r['source_url']}")
+            continue
+        if r["quote_verified"]:
+            notes.append(f"✓ {label} — verbatim quote present in {r['source_url']}")
+        else:
+            has_unverified = True
+            notes.append(
+                f"✗ {label} — quote NOT found verbatim in source "
+                f"({r['source_url']}); reviewer may be paraphrasing or misciting"
+            )
+
+    if has_unresolved or has_unverified:
+        return "fail", notes
+    if has_no_quote:
+        return "warn", notes
+    return "pass", notes
+
+
+def _grade_public_sources(
+    all_results: list[dict[str, Any]],
+    legal_spec: list[dict[str, Any]],
+    fact_spec: list[dict[str, Any]],
+) -> tuple[str, list[str]]:
+    """Apply the product-counsel "public sources only" policy.
+
+    Operates on the *legal* spec results only — facts can come from internal
+    GitHub sources (the issue itself) without violating the policy. For each
+    legal anchor, classify by the resolved classification when available, or
+    by the heuristic in `_check_one_quote` when the source couldn't be reached.
+    """
+    notes: list[str] = []
+    has_warn = False
+    legal_specs_with_results = list(zip(legal_spec, all_results[: len(legal_spec)]))
+    for spec, r in legal_specs_with_results:
+        cls = r["classification"]
+        label = spec.get("label") or r["ref"]
+        if cls not in _PUBLIC_PRIMARY_CLASSES:
+            has_warn = True
+            reachable = "" if r["resolved"] else " (also unreachable: " + (r["error"] or "") + ")"
+            notes.append(
+                f"⚠ Legal anchor `{label}` is `{cls}`{reachable} — "
+                f"may be used only as background context, NOT as the basis for the "
+                f"legal conclusion (per product-counsel agent constraint)"
+            )
+        elif cls == "verify-required":
+            notes.append(
+                f"ℹ Legal anchor `{label}` is web-fetched (`verify-required`) — "
+                f"append [VERIFY] tag in the final review text"
+            )
+    if not notes:
+        notes.append("✓ all primary legal sources are publicly citable")
+    return ("warn" if has_warn else "pass"), notes
+
+
+def _format_pressure_test_report(report: dict[str, Any]) -> str:
+    lines: list[str] = []
+    target = report.get("review_target", "(unspecified)")
+    lines.append(f"# Pressure-test report — {target}\n")
+    if report.get("review_summary"):
+        lines.append(f"_Review summary:_ {report['review_summary']}\n")
+
+    summary_pass = sum(1 for r in report["risks"] if r["overall"] == "PASS")
+    summary_warn = sum(1 for r in report["risks"] if r["overall"] == "WARN")
+    summary_fail = sum(1 for r in report["risks"] if r["overall"] == "FAIL")
+    total = len(report["risks"])
+    lines.append(
+        f"**{total} risks tested** · ✓ {summary_pass} hold up · "
+        f"⚠ {summary_warn} with warnings · ✗ {summary_fail} with gaps\n"
+    )
+
+    for risk in report["risks"]:
+        glyph = {"PASS": "✓", "WARN": "⚠", "FAIL": "✗"}[risk["overall"]]
+        tier = (risk.get("tier") or "").upper()
+        lines.append(f"## {glyph} RISK {risk.get('id') or ''} — {risk.get('label') or '(unlabeled)'} ({tier})  →  {risk['overall']}")
+        if risk.get("claim"):
+            lines.append(f"_Claim:_ {risk['claim']}\n")
+
+        for dim_name, dim in (("Legal anchor", risk["legal"]),
+                              ("Product fact", risk["fact"]),
+                              ("Public-source policy", risk["public_sources"])):
+            badge = {"pass": "✓", "warn": "⚠", "fail": "✗"}[dim["status"]]
+            lines.append(f"  - **{badge} {dim_name}** ({dim['status']})")
+            for note in dim["notes"]:
+                lines.append(f"    - {note}")
+        lines.append("")
+
+    fails = [r for r in report["risks"] if r["overall"] == "FAIL"]
+    warns = [r for r in report["risks"] if r["overall"] == "WARN"]
+    if fails or warns:
+        lines.append("## Suggested follow-ups")
+        for r in fails:
+            lines.append(f"- Risk {r.get('id') or ''} ({r.get('label') or ''}): resolve the ✗ items above before relying on this risk in the final review.")
+        for r in warns:
+            lines.append(f"- Risk {r.get('id') or ''} ({r.get('label') or ''}): pin a verbatim quote for any ⚠ items, and confirm the public-source classification of any background refs.")
+    else:
+        lines.append("All flagged risks are anchored by verbatim, publicly-citable text on both the legal and factual sides. The review holds up.")
+
+    return "\n".join(lines)
+
+
+def cmd_pressure_test(args: argparse.Namespace) -> int:
+    spec_path = Path(args.spec).expanduser()
+    if not spec_path.exists():
+        print(f"error: spec file not found: {spec_path}", file=sys.stderr)
+        return 1
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        print(f"error: spec is not valid JSON: {e}", file=sys.stderr)
+        return 1
+
+    risks_in = spec.get("risks") or []
+    if not risks_in:
+        print("error: spec has no `risks` to test", file=sys.stderr)
+        return 1
+
+    # Optional filter by --risk-id (one or many)
+    if args.risk_id:
+        wanted = set(args.risk_id)
+        risks_in = [r for r in risks_in if r.get("id") in wanted]
+        if not risks_in:
+            print(f"error: no risks in spec match --risk-id {sorted(wanted)}", file=sys.stderr)
+            return 1
+
+    report = {
+        "review_target": spec.get("review_target"),
+        "review_summary": spec.get("review_summary"),
+        "risks": [_pressure_test_one_risk(r) for r in risks_in],
+    }
+
+    if args.json:
+        print(json.dumps(report, indent=2))
+    else:
+        print(_format_pressure_test_report(report))
+
+    # Exit code reflects the worst outcome:
+    #   0 = all PASS
+    #   1 = at least one WARN, no FAIL
+    #   2 = at least one FAIL
+    if any(r["overall"] == "FAIL" for r in report["risks"]):
+        return 2
+    if any(r["overall"] == "WARN" for r in report["risks"]):
+        return 1
+    return 0
+
+
 # --- entrypoint --------------------------------------------------------------
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -1256,6 +1572,17 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--no-screenshots", action="store_true", help="skip screenshot rendering; emit text-only quote blocks")
     sp.add_argument("--image-width", type=float, default=6.0, help="screenshot width in inches (default: 6.0)")
     sp.set_defaults(func=cmd_build)
+
+    sp = sub.add_parser(
+        "pressure-test",
+        help="validate an existing review: byte-check the cited law and product facts, "
+             "and surface gaps in the legal/factual anchoring",
+    )
+    sp.add_argument("--spec", required=True, help="path to a JSON pressure-test spec (see SKILL.md schema)")
+    sp.add_argument("--risk-id", action="append",
+                    help="optional: only test these risk ids (can be repeated)")
+    sp.add_argument("--json", action="store_true", help="emit machine-readable JSON instead of the markdown report")
+    sp.set_defaults(func=cmd_pressure_test)
 
     return p
 

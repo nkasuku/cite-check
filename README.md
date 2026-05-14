@@ -10,6 +10,10 @@ This is a Copilot CLI plugin that turns flagged risks in a product review into *
 
 ## What it does
 
+cite-check has two modes.
+
+### Mode A — ORIGINATE (Citation Cards from a fresh review)
+
 You point Copilot at a Privacy and Product Legal (PPL) review issue (or paste in a flagged risk paragraph) and tell it to use cite-check. The skill:
 
 1. Extracts the **product facts** from the issue body, comments, and any linked design docs.
@@ -20,7 +24,21 @@ You point Copilot at a Privacy and Product Legal (PPL) review issue (or paste in
 
 If the legal screenshot doesn't show what the analysis claims, or the product screenshot doesn't show what the analysis claims, you can see it immediately — without believing the AI.
 
-## Why two screenshots per claim?
+### Mode B — PRESSURE-TEST (validate a review you already have)
+
+You've already done the review. Now you want to be sure the citations actually hold up. Tell Copilot *"pressure-test the cross-border transfer risk"* (or *"pressure-test all the High-tier risks"*). The skill:
+
+1. Reads the existing review from the conversation (or from a GitHub issue/comment).
+2. Builds a JSON spec listing each risk's claim, asserted legal sources, and asserted product facts.
+3. For each risk, runs three checks:
+   - **Legal anchor:** does the cited provision actually contain the quote (or, if no quote was provided, does the source at least resolve)?
+   - **Product fact:** does the cited issue/comment actually say what the review attributes to it, byte-for-byte?
+   - **Public-source policy:** is every primary cite publicly citable, or is a `github-internal` document being used as the basis for a legal conclusion?
+4. Surfaces a per-risk PASS / WARN / FAIL report inline, with specifics on every gap.
+
+Use Mode B when you want to pressure-test before sending the review out. It catches paraphrased law, hallucinated product quotes, dead links, and reliance on internal-only sources.
+
+## Why two anchors per risk?
 
 A product counsel reviewing AI-assisted output is the most hallucination-sensitive consumer in the building. There are two failure modes:
 

@@ -1,6 +1,6 @@
 ---
 name: cite-check
-description: 'Verifiable legal-citation tooling for product counsel reviews. When activated, cite-check turns a flagged risk (or a whole PPL review issue) into a Word document of Citation Cards, where every claim is anchored by two highlighted quotes — one from the legal source, one from the product fact — both byte-for-byte verified against the source before the document is written.'
+description: 'Verifiable legal-citation tooling for product counsel reviews. Two modes: (1) ORIGINATE — turn a PPL issue into a Word document of Citation Cards where every flagged risk is anchored by two highlighted quotes (legal source + product fact), byte-for-byte verified before write. (2) PRESSURE-TEST — given an existing review the user has already done, validate that each flagged risk is backed by verbatim, publicly-citable text on both the legal and factual sides, and surface gaps (paraphrased law, missing facts, internal-only sources used as primary cites).'
 triggers:
   - cite-check
   - cite check
@@ -11,6 +11,12 @@ triggers:
   - legal citation review
   - PPL citation
   - PPL review citations
+  - pressure-test the review
+  - pressure-test this risk
+  - pressure-test that risk
+  - pressure test the review
+  - stress test the review
+  - validate the review citations
 tools:
   - ask_user
   - bash
@@ -25,17 +31,35 @@ tools:
 
 # cite-check — Copilot CLI Skill
 
-Helps a GitHub product counsel verify AI-generated legal citations in Privacy and Product Legal (PPL) reviews. Produces a Word document of **Citation Cards** on the user's Desktop where each flagged risk is anchored by verbatim quotes from (a) the legal source and (b) the product fact, with byte-for-byte verification done before the document is written.
+Helps a GitHub product counsel verify AI-generated legal citations in Privacy and Product Legal (PPL) reviews. Modeled on [`dvelton/eyeball`](https://github.com/dvelton/eyeball). Eyeball anchors one claim to one source. cite-check anchors one risk to two — the law and the fact — because in a legal review either anchor failing means the conclusion is wrong.
 
-Modeled on [`dvelton/eyeball`](https://github.com/dvelton/eyeball). Eyeball anchors one claim to one source. cite-check anchors one risk to two — the law and the fact — because in a legal review either anchor failing means the conclusion is wrong.
+## Two modes
+
+cite-check has two distinct workflows. Pick the right one based on what the user asked for.
+
+### Mode A — ORIGINATE (build a fresh Citation Card)
+
+Trigger when the user asks you to *do* the citation work: *"cite-check issue #847"*, *"build a citation card for the new MAI model review"*, *"run cite-check"*. You read the issue, identify risks, find the legal anchors, verify everything, build the .docx.
+
+Use this mode when **no review yet exists** — the user wants you to produce one with verifiable citations.
+
+### Mode B — PRESSURE-TEST (validate a review the user already has)
+
+Trigger when the user asks you to *check* an existing review: *"pressure-test the cross-border transfer risk"*, *"pressure-test all the High-tier risks in the review above"*, *"validate the citations in that review"*, *"stress test the AI Act argument"*.
+
+Use this mode when **a review already exists in the conversation** (either the user did it, or the product-counsel agent produced one earlier in the session). You don't re-do the review. You take its risk statements as input and validate them.
+
+The output of Mode B is **a per-risk pass/fail report inline in chat**, never a Word doc unless the user explicitly asks "now build the doc."
 
 ## Activation
 
-When the user invokes this skill (e.g., "use cite-check", "run cite-check on issue #847", "cite-check this risk"), respond with:
+When the user invokes this skill, respond with one of:
 
-> **cite-check is active.** I'll extract the product facts, identify the implicated legal provisions, byte-for-byte verify every quote, and produce a Word document of Citation Cards on your Desktop. Anything I cannot verify will be refused — never silently quoted.
+> **cite-check (originate mode) is active.** I'll extract the product facts, identify the implicated legal provisions, byte-for-byte verify every quote, and produce a Word document of Citation Cards on your Desktop. Anything I cannot verify will be refused — never silently quoted.
 
-Then follow the workflow below.
+> **cite-check (pressure-test mode) is active.** I'll take the risk(s) you've already flagged and check three things for each one: (a) the cited law actually says verbatim what the risk attributes to it, (b) the cited product fact actually appears in the issue, and (c) every primary cite is publicly citable. Gaps surface inline; nothing is silently smoothed over.
+
+Then follow the workflow below for the chosen mode.
 
 ## Tool location
 
@@ -87,7 +111,7 @@ These rules implement the user's standing custom instructions. They are non-nego
 5. **Never paraphrase inside a quote block.** Citation card quote blocks contain only verbatim text from the source. Analytical text (your interpretation, the nexus, the recommendation) lives in the `nexus` and `action` fields, never in `quote`.
 6. **No final legal advice.** The output document is always framed as a drafting aid. Do not change the disclaimer banner the build tool emits.
 
-## Workflow
+## Workflow — Mode A (ORIGINATE)
 
 Follow these steps in order. The order matters.
 
@@ -266,6 +290,97 @@ Tell the user:
 - any refusals (verify failures, missing sources) and what the user should do about each
 - the next reviewer action you'd recommend (e.g., "ready for your read; one card on data retention is parked because GDPR Art. 5(1)(e) wasn't yet in the cache — run `refresh-corpus` and re-run cite-check on that risk only")
 
+## Workflow — Mode B (PRESSURE-TEST)
+
+Use this when a review **already exists** in the conversation (the user did it, or the product-counsel agent produced it earlier in the session) and the user wants you to validate the citations rather than originate new ones.
+
+### Step B1 — Confirm what to pressure-test
+
+Use `ask_user` if it's ambiguous which risks to test. Common asks:
+- *"pressure-test the cross-border transfer risk"* → one specific risk
+- *"pressure-test all the High-tier risks"* → tier filter
+- *"pressure-test that whole review"* → all risks
+
+Do not bundle multiple questions. If the user said something specific, just go.
+
+### Step B2 — Assemble the pressure-test spec
+
+Read the existing review text (in conversation, in a file, or in a GitHub issue/comment). For each risk you'll test, build a JSON object with these fields. Save the full spec to `~/.copilot/skills/cite-check/cache/pressure-tests/spec-<timestamp>.json` (or `/tmp/pt-spec-<short-id>.json` for a quick one-off).
+
+```json
+{
+  "review_target": "<owner>/<repo>#<N>  (e.g., github/product-and-privacy-legal#2398)",
+  "review_summary": "One-sentence description of what was reviewed.",
+  "risks": [
+    {
+      "id": "<short-stable-id>",
+      "label": "<one-line risk title from the review>",
+      "tier": "HIGH | MEDIUM | LOW",
+      "claim": "<the actual sentence(s) from the review that state the risk and the legal conclusion>",
+      "asserted_legal_sources": [
+        {
+          "label": "<human-readable label, e.g., 'GDPR Art. 5(1)(a)'>",
+          "ref": "<a ref the dispatcher can resolve — see refs below>",
+          "quote": "<OPTIONAL verbatim quote the review attributes to this source>"
+        }
+      ],
+      "asserted_product_facts": [
+        {
+          "label": "<e.g., 'comment from kayreiman about telemetry opt-out'>",
+          "ref": "<owner>/<repo>#<N>::comment_<id>  OR  <owner>/<repo>#<N>",
+          "quote": "<REQUIRED verbatim quote the review attributes to this fact>"
+        }
+      ]
+    }
+  ]
+}
+```
+
+**Resolvable `ref` formats** (handled by `_resolve_source_text`):
+- `<filename-from-corpus>.md` → cached file in `~/.copilot/skills/cite-check/cache/corpus/`
+- `<filename-from-corpus>.md#<anchor>` → specific section
+- `https://...` → fetched live (auto-tagged `verify-required`)
+- `<owner>/<repo>#<N>` → full issue body
+- `<owner>/<repo>#<N>::comment_<id>` → single comment
+
+**Spec-construction rules:**
+1. Pull `claim` and `quote` strings *verbatim from the review*. Do not paraphrase. If the review paraphrases the law (no quote provided), leave `quote` empty on that legal source — pressure-test will warn about that.
+2. If the review cites a private/internal document (PPL issue, internal playbook), include it anyway. Pressure-test will catch it and warn that it can be background only.
+3. One risk per object. If the review bundles multiple legal hooks under one risk, that's fine — list them all under `asserted_legal_sources`.
+
+### Step B3 — Run the pressure test
+
+```bash
+python3 <path-to>/cite.py pressure-test --spec <path-to-spec.json>
+```
+
+Optional flags:
+- `--risk-id <id>` to test only one risk from the spec
+- `--json` for machine-readable output (use this if you'll post-process the results)
+
+Exit code: `0` = all PASS, `1` = at least one WARN, `2` = at least one FAIL.
+
+### Step B4 — Surface the report inline
+
+The default output is markdown. Post the relevant sections inline in the conversation. For each risk:
+
+- **PASS** — say so in one line and move on
+- **WARN** — explain what the warning means (typically: a legal cite resolves but no verbatim quote was provided, OR a primary cite is `github-internal` and may only be background)
+- **FAIL** — be specific about which dimension failed and why. Common failures:
+  - *Legal quote not verbatim:* the law doesn't actually say what the review claims it says. The reviewer needs to either find the right provision or rewrite the claim.
+  - *Product fact not verbatim:* the issue/comment doesn't actually say what the review attributes to it. Possible hallucination or misattribution.
+  - *Ref unresolved (HTTP error / 404):* almost always means a private/internal GitHub URL was cited. Pressure-test downgrades it to `github-internal` and warns. The reviewer may need to either authenticate the cite (find a public counterpart) or move it to background-only.
+  - *Public-source policy ⚠:* a `github-internal` document is being used as a primary cite. Per product-counsel agent rules, internal docs are background context only — the legal conclusion has to rest on a public source.
+
+### Step B5 — Offer follow-ups, but don't take them on your own
+
+After delivering the report, offer (one at a time, do not bundle):
+- *"Want me to search the corpus for a verbatim provision that actually supports risk X?"*
+- *"Want me to build a Citation Card .docx for the risks that passed?"* (this is Mode A on the passing subset)
+- *"Want to refresh the corpus and re-run? I noticed the cite for X isn't in the cached set."*
+
+Do **not** modify the underlying review unless the user explicitly asks you to. Pressure-test is a diagnostic — fixing the review is a separate ask.
+
 ## Self-check before delivery
 
 Before saving the cards file or running `build`, mentally verify:
@@ -306,3 +421,6 @@ If the right provision is on a public regulator's site but not in the cache, and
 | User pastes a risk with no clear product fact | Missing factual anchor | Use `ask_user` to ask for the issue ref, design doc URL, or specific quote that triggered the concern. Do not invent a fact. |
 | Provision exists only in a `github-internal` doc | Cannot serve as legal basis | Surface the *public* analogue (regulation, GitHub public commitment); demote the internal doc to `INTERNAL CONTEXT — background only` |
 | Build succeeds but several render-notes appear | Screenshots failed for renderable sources (e.g., a public URL was 503) | Re-run build later, or drop `--no-screenshots` for a text-only doc, or replace the URL ref with a cached corpus ref if the same content is mirrored. |
+| `pressure-test` reports a ref as "could not resolve" with HTTPError 404 | The cited URL is private/internal (or genuinely missing); pressure-test auto-classifies it as `github-internal` | Tell the user the cite is private. Either find a public counterpart or move that source to background-only and rest the legal conclusion on a public cite. |
+| `pressure-test` reports `quote NOT found verbatim` on a product fact | The review attributes language to a comment/issue body that the source doesn't actually contain (paraphrase, hallucination, or wrong comment ID) | Re-extract the source with `extract-facts` and find the actual nearest verbatim span; either rewrite the claim to use real language or flag it for the reviewer's correction |
+| `pressure-test` reports `ref resolves but no verbatim quote provided` (warn) | The reviewer cited a provision generically without pinning specific language | Ask the user whether they want help finding the most relevant verbatim sub-clause from that provision, or whether the generic cite is acceptable |
