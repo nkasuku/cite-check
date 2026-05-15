@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import dataclasses
 import hashlib
 import json
@@ -648,6 +649,32 @@ def _load_auth_text(filename: str) -> Optional[str]:
         return None
     try:
         return p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def _auth_age_days(filename: str) -> Optional[float]:
+    """Return how many days old the cached authoritative copy is, or None.
+
+    Reads the manifest's `fetched_at` ISO timestamp first; falls back to the
+    on-disk mtime if the manifest is missing or unparseable. Returns None when
+    the file isn't cached at all.
+    """
+    if not _auth_text_path(filename).exists():
+        return None
+    manifest = _load_auth_manifest()
+    record = manifest.get("files", {}).get(filename) or {}
+    fetched_at = record.get("fetched_at")
+    if fetched_at:
+        try:
+            t = time.strptime(fetched_at, "%Y-%m-%dT%H:%M:%SZ")
+            fetched_epoch = calendar.timegm(t)
+            return max(0.0, (time.time() - fetched_epoch) / 86400.0)
+        except (ValueError, TypeError):
+            pass
+    try:
+        mtime = _auth_text_path(filename).stat().st_mtime
+        return max(0.0, (time.time() - mtime) / 86400.0)
     except OSError:
         return None
 
@@ -1754,6 +1781,13 @@ def cmd_build(args: argparse.Namespace) -> int:
 
 _PUBLIC_PRIMARY_CLASSES = {"public-law", "public-guidance", "github-public", "verify-required"}
 
+# Default freshness window for the cached authoritative-source copies. When a
+# pressure-test run consults a cached auth source older than this, it surfaces
+# a warning ("authoritative source is N days old; consider running
+# refresh-authoritative") so reviewers know they're verifying against
+# potentially stale data — without blocking the run.
+_AUTH_FRESHNESS_DAYS_DEFAULT = 30.0
+
 
 def _classify_ref_for_pressure_test(ref: str) -> str:
     """Return the classification cite-check would assign to this ref, for
@@ -1768,7 +1802,12 @@ def _classify_ref_for_pressure_test(ref: str) -> str:
     return _classification_for(filename)
 
 
-def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
+def _check_one_quote(
+    ref: str,
+    quote: Optional[str],
+    *,
+    auth_freshness_days: float = _AUTH_FRESHNESS_DAYS_DEFAULT,
+) -> dict[str, Any]:
     """Resolve one source ref and (optionally) verify a quote against it.
 
     Verification is *authoritative-first*: when the ref points to a corpus
@@ -1780,7 +1819,8 @@ def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
     Returns a dict with: ref, classification, source_url, resolved (bool),
     error (if any), quote_provided (bool), quote_verified (bool|None),
     authoritative_url (str|None), authoritative_verified (bool|None),
-    verified_against ('authoritative' | 'mirror' | None).
+    verified_against ('authoritative' | 'mirror' | None),
+    auth_age_days (float|None), auth_stale (bool).
     """
     out: dict[str, Any] = {
         "ref": ref,
@@ -1793,6 +1833,8 @@ def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
         "authoritative_url": None,
         "authoritative_verified": None,
         "verified_against": None,
+        "auth_age_days": None,
+        "auth_stale": False,
     }
     try:
         source = _resolve_source_text(ref)
@@ -1818,6 +1860,11 @@ def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
         if auth_meta:
             out["authoritative_url"] = auth_meta.get("authoritative_url")
             auth_text = _load_auth_text(corpus_filename)
+            age = _auth_age_days(corpus_filename)
+            if age is not None:
+                out["auth_age_days"] = round(age, 1)
+                if age > auth_freshness_days:
+                    out["auth_stale"] = True
 
     if quote and quote.strip():
         q_norm = _normalize_for_match(quote)
@@ -1843,12 +1890,22 @@ def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
     return out
 
 
-def _pressure_test_one_risk(risk: dict[str, Any]) -> dict[str, Any]:
+def _pressure_test_one_risk(
+    risk: dict[str, Any],
+    *,
+    auth_freshness_days: float = _AUTH_FRESHNESS_DAYS_DEFAULT,
+) -> dict[str, Any]:
     legal = risk.get("asserted_legal_sources") or []
     facts = risk.get("asserted_product_facts") or []
 
-    legal_results = [_check_one_quote(r.get("ref", ""), r.get("quote")) for r in legal]
-    fact_results = [_check_one_quote(r.get("ref", ""), r.get("quote")) for r in facts]
+    legal_results = [
+        _check_one_quote(r.get("ref", ""), r.get("quote"), auth_freshness_days=auth_freshness_days)
+        for r in legal
+    ]
+    fact_results = [
+        _check_one_quote(r.get("ref", ""), r.get("quote"), auth_freshness_days=auth_freshness_days)
+        for r in facts
+    ]
 
     # Compute per-dimension status
     legal_status, legal_notes = _grade_dimension(
@@ -1856,12 +1913,14 @@ def _pressure_test_one_risk(risk: dict[str, Any]) -> dict[str, Any]:
         legal,
         category="legal",
         require_verified_quote=True,
+        auth_freshness_days=auth_freshness_days,
     )
     fact_status, fact_notes = _grade_dimension(
         fact_results,
         facts,
         category="fact",
         require_verified_quote=True,
+        auth_freshness_days=auth_freshness_days,
     )
     public_status, public_notes = _grade_public_sources(legal_results + fact_results, legal, facts)
 
@@ -1889,6 +1948,7 @@ def _grade_dimension(
     *,
     category: str,
     require_verified_quote: bool,
+    auth_freshness_days: float = _AUTH_FRESHNESS_DAYS_DEFAULT,
 ) -> tuple[str, list[str]]:
     """Return (status, notes) for the legal or fact dimension.
 
@@ -1911,6 +1971,7 @@ def _grade_dimension(
     has_unverified = False
     has_no_quote = False
     has_corpus_drift = False
+    has_stale_auth = False
     for r, s in zip(results, spec):
         label = s.get("label") or r["ref"]
         if not r["resolved"]:
@@ -1935,6 +1996,16 @@ def _grade_dimension(
                 notes.append(
                     f"✓✓ {label} — verbatim quote verified against authoritative source ({auth_url})"
                 )
+                if r.get("auth_stale"):
+                    has_stale_auth = True
+                    age = r.get("auth_age_days")
+                    age_str = f"{age:.1f}d" if isinstance(age, (int, float)) else "unknown"
+                    corpus_filename = r.get("ref", "").split("#", 1)[0]
+                    notes.append(
+                        f"  ⚠ authoritative copy is {age_str} old (threshold: {auth_freshness_days:g}d) — "
+                        f"re-fetch with `cite.py refresh-authoritative --only {corpus_filename} --force` "
+                        f"to confirm the publisher hasn't amended the source since"
+                    )
             else:
                 # mirror-only verification
                 if auth_url:
@@ -1968,7 +2039,7 @@ def _grade_dimension(
 
     if has_unresolved or has_unverified:
         return "fail", notes
-    if has_no_quote or has_corpus_drift:
+    if has_no_quote or has_corpus_drift or has_stale_auth:
         return "warn", notes
     return "pass", notes
 
@@ -2079,10 +2150,15 @@ def cmd_pressure_test(args: argparse.Namespace) -> int:
             print(f"error: no risks in spec match --risk-id {sorted(wanted)}", file=sys.stderr)
             return 1
 
+    auth_freshness_days = getattr(args, "auth_freshness_days", _AUTH_FRESHNESS_DAYS_DEFAULT)
     report = {
         "review_target": spec.get("review_target"),
         "review_summary": spec.get("review_summary"),
-        "risks": [_pressure_test_one_risk(r) for r in risks_in],
+        "auth_freshness_days": auth_freshness_days,
+        "risks": [
+            _pressure_test_one_risk(r, auth_freshness_days=auth_freshness_days)
+            for r in risks_in
+        ],
     }
 
     if args.json:
@@ -2175,6 +2251,16 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--spec", required=True, help="path to a JSON pressure-test spec (see SKILL.md schema)")
     sp.add_argument("--risk-id", action="append",
                     help="optional: only test these risk ids (can be repeated)")
+    sp.add_argument(
+        "--auth-freshness-days",
+        type=float,
+        default=_AUTH_FRESHNESS_DAYS_DEFAULT,
+        help=(
+            "warn (do not block) when a cited file's authoritative-source cache is "
+            f"older than this many days (default: {_AUTH_FRESHNESS_DAYS_DEFAULT:g}). "
+            "Use a larger value to silence freshness warnings; use 0 to flag every cite."
+        ),
+    )
     sp.add_argument("--json", action="store_true", help="emit machine-readable JSON instead of the markdown report")
     sp.set_defaults(func=cmd_pressure_test)
 
