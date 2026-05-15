@@ -54,6 +54,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
@@ -68,6 +69,8 @@ CORPUS_DIR = CACHE_ROOT / "corpus"
 FETCHED_DIR = CACHE_ROOT / "fetched"
 FACTS_DIR = CACHE_ROOT / "facts"
 RENDERED_DIR = CACHE_ROOT / "rendered"
+AUTH_DIR = CACHE_ROOT / "authoritative"
+AUTH_MANIFEST = AUTH_DIR / "manifest.json"
 INDEX_PATH = CACHE_ROOT / "index.json"
 
 REFERENCE_REPO = "github/ppl-legal-reference"
@@ -76,7 +79,7 @@ REFERENCE_REPO = "github/ppl-legal-reference"
 # --- small helpers -----------------------------------------------------------
 
 def _ensure_dirs() -> None:
-    for p in (CORPUS_DIR, FETCHED_DIR, FACTS_DIR, RENDERED_DIR):
+    for p in (CORPUS_DIR, FETCHED_DIR, FACTS_DIR, RENDERED_DIR, AUTH_DIR):
         p.mkdir(parents=True, exist_ok=True)
 
 
@@ -110,14 +113,16 @@ def _classification_for(filename: str) -> str:
     """Map the ppl-legal-reference filename prefix to a source classification.
 
     Mirrors the prefix taxonomy described in the user's custom instructions:
-      01-github-*  → github-public  (ToS, DPA, Privacy Statement, AUP, ...)
+      01-github-*   → github-public  (ToS, DPA, Privacy Statement, AUP, ...)
       02-internal-* → github-internal  (playbooks, training)
-      03-reg-*     → public-law
-      04-msft-*    → public-guidance  (Microsoft DPA / minimum bar)
+      03-reg-*      → public-law
+      04-msft-*     → github-internal  (Microsoft contractual instruments — not
+                       posted publicly, only shared with partners; cannot be a
+                       primary cite for a legal conclusion)
       05-guidance-* → public-guidance
-      06-ip-*      → public-law       (Title 17 + open source licenses)
-      07-process-* → github-internal
-      08-caselaw-* → public-guidance
+      06-ip-*       → public-law       (Title 17 + open source licenses)
+      07-process-*  → github-internal
+      08-caselaw-*  → public-guidance
     """
     base = filename.lower()
     if base.startswith("01-github-"):
@@ -127,7 +132,7 @@ def _classification_for(filename: str) -> str:
     if base.startswith("03-reg-"):
         return "public-law"
     if base.startswith("04-msft-"):
-        return "public-guidance"
+        return "github-internal"
     if base.startswith("05-guidance-"):
         return "public-guidance"
     if base.startswith("06-ip-"):
@@ -139,6 +144,49 @@ def _classification_for(filename: str) -> str:
     return "github-public"
 
 
+def _normalize_allowlist(taxonomy: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return the cached_corpus_allowlist as a list of dicts.
+
+    The taxonomy file may store entries as plain filename strings (legacy v2
+    schema) or as objects with `filename` plus authoritative-source metadata
+    (v3 schema). Normalize to a uniform list of dicts so callers don't care.
+    Each returned dict has at least: filename, authoritative_url (or None),
+    authoritative_format (or None), extractor (or None).
+    """
+    raw = taxonomy.get("cached_corpus_allowlist", []) or []
+    out: list[dict[str, Any]] = []
+    for entry in raw:
+        if isinstance(entry, str):
+            out.append({
+                "filename": entry,
+                "authoritative_url": None,
+                "authoritative_format": None,
+                "extractor": None,
+            })
+        elif isinstance(entry, dict) and entry.get("filename"):
+            out.append({
+                "filename": entry["filename"],
+                "authoritative_url": entry.get("authoritative_url"),
+                "authoritative_format": entry.get("authoritative_format"),
+                "extractor": entry.get("extractor"),
+                "_note": entry.get("_note"),
+            })
+    return out
+
+
+def _allowlist_filenames(taxonomy: dict[str, Any]) -> list[str]:
+    return [e["filename"] for e in _normalize_allowlist(taxonomy)]
+
+
+def _authoritative_meta_for(filename: str) -> Optional[dict[str, Any]]:
+    """Return the authoritative-source metadata for a corpus filename, or None."""
+    taxonomy = _load_taxonomy()
+    for entry in _normalize_allowlist(taxonomy):
+        if entry["filename"] == filename and entry.get("authoritative_url"):
+            return entry
+    return None
+
+
 # --- subcommand: setup-check -------------------------------------------------
 
 def cmd_setup_check(_args: argparse.Namespace) -> int:
@@ -148,7 +196,7 @@ def cmd_setup_check(_args: argparse.Namespace) -> int:
 
     print(f"  python:       {sys.version.split()[0]}")
 
-    for mod in ("docx", "fitz", "PIL", "playwright", "yaml", "requests", "markdown"):
+    for mod in ("docx", "fitz", "PIL", "playwright", "yaml", "requests", "markdown", "bs4", "lxml", "pdfminer"):
         try:
             __import__(mod if mod != "docx" else "docx")
             print(f"  module {mod:<12} ✓")
@@ -290,7 +338,7 @@ def cmd_refresh_corpus(args: argparse.Namespace) -> int:
 
     _ensure_dirs()
     taxonomy = _load_taxonomy()
-    allowlist: list[str] = list(taxonomy.get("cached_corpus_allowlist", []))
+    allowlist: list[str] = _allowlist_filenames(taxonomy)
     if args.only:
         allowlist = [f for f in allowlist if f in set(args.only)]
 
@@ -351,6 +399,462 @@ def cmd_refresh_corpus(args: argparse.Namespace) -> int:
     INDEX_PATH.write_text(json.dumps(index, indent=2), encoding="utf-8")
     print(f"\nWrote index: {INDEX_PATH}")
     return 0
+
+
+# --- authoritative-source layer ---------------------------------------------
+#
+# For every publicly-citable file in the corpus, taxonomy.json maps it to an
+# `authoritative_url` published by the regulator / legislature / standards body
+# itself (EUR-Lex, leginfo.legislature.ca.gov, gnu.org, docs.github.com, etc.).
+# `refresh-authoritative` fetches each URL, normalizes the content to plain
+# text, and stores it under cache/authoritative/<filename>.txt with a manifest
+# entry. `verify-corpus` then diffs the cached corpus copy against the
+# authoritative copy to detect drift (mirror is stale, edited, or incomplete).
+# Pressure-test consults the authoritative copy first for byte-for-byte quote
+# verification, falling back to the mirror only when the auth source is
+# unreachable.
+
+_USER_AGENT = (
+    "cite-check/0.2 (legal-citation verifier; "
+    "+https://github.com/nkasuku/cite-check)"
+)
+
+
+def _auth_text_path(filename: str) -> Path:
+    return AUTH_DIR / (filename.rsplit(".", 1)[0] + ".txt")
+
+
+def _load_auth_manifest() -> dict[str, Any]:
+    if not AUTH_MANIFEST.exists():
+        return {"files": {}}
+    try:
+        return json.loads(AUTH_MANIFEST.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, ValueError):
+        return {"files": {}}
+
+
+def _write_auth_manifest(manifest: dict[str, Any]) -> None:
+    AUTH_MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8")
+
+
+def _http_get(url: str, *, accept: str = "text/html,application/xhtml+xml,*/*"):
+    """Polite HTTP GET with a stable user agent and reasonable timeout."""
+    import requests  # noqa: WPS433 — deferred so setup-check can report missing dep
+    return requests.get(
+        url,
+        headers={"User-Agent": _USER_AGENT, "Accept": accept},
+        timeout=45,
+        allow_redirects=True,
+    )
+
+
+def _extract_eur_lex(html: str) -> str:
+    """EUR-Lex serves XHTML. Take the body text — it includes all recitals,
+    articles, and annexes in a single document with no navigation chrome to
+    speak of inside <body><div>."""
+    import warnings
+    from bs4 import XMLParsedAsHTMLWarning  # type: ignore
+    warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    body = soup.find("body") or soup
+    return body.get_text(separator="\n", strip=True)
+
+
+def _extract_github_docs(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = (
+        soup.select_one("div[data-search='article-body']")
+        or soup.select_one("div.markdown-body")
+        or soup.select_one("article")
+        or soup.select_one("main")
+    )
+    if el is None:
+        return ""
+    return el.get_text(separator="\n", strip=True)
+
+
+def _extract_legislation_uk(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = (
+        soup.select_one("#content")
+        or soup.select_one("#viewLegContents")
+        or soup.select_one(".LegContent")
+        or soup.find("body")
+    )
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_leginfo(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = (
+        soup.select_one("#manylawsections")
+        or soup.select_one("#centerColumn")
+        or soup.find("body")
+    )
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_ftc(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = (
+        soup.select_one("article")
+        or soup.select_one("main")
+        or soup.find("body")
+    )
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_curia(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    # Curia HTML wraps the judgment text in <div class="C19Centre"> or similar
+    # depending on doc; fall back to body text.
+    el = (
+        soup.select_one("body > div.C19Centre")
+        or soup.find("body")
+    )
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_wp29(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = soup.select_one("main") or soup.select_one("article") or soup.find("body")
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_opensource_org(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = (
+        soup.select_one("article")
+        or soup.select_one("main")
+        or soup.select_one(".entry-content")
+        or soup.find("body")
+    )
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_spdx(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = soup.select_one("table") or soup.find("body")
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_cornell_lii(html: str) -> str:
+    from bs4 import BeautifulSoup  # type: ignore
+    soup = BeautifulSoup(html, "lxml")
+    el = (
+        soup.select_one("#main-content")
+        or soup.select_one("main")
+        or soup.select_one("#content")
+        or soup.find("body")
+    )
+    return el.get_text(separator="\n", strip=True) if el else ""
+
+
+def _extract_text(text: str) -> str:
+    """Identity for plain-text sources (gnu.org, apache.org license files)."""
+    return text
+
+
+def _extract_pdf(pdf_bytes: bytes) -> str:
+    """Use pdfminer to pull text out of the PDF."""
+    from io import BytesIO
+    from pdfminer.high_level import extract_text  # type: ignore
+    return extract_text(BytesIO(pdf_bytes))
+
+
+_EXTRACTORS = {
+    "eur_lex": _extract_eur_lex,
+    "github_docs": _extract_github_docs,
+    "legislation_uk": _extract_legislation_uk,
+    "leginfo": _extract_leginfo,
+    "ftc": _extract_ftc,
+    "curia": _extract_curia,
+    "wp29": _extract_wp29,
+    "opensource_org": _extract_opensource_org,
+    "spdx": _extract_spdx,
+    "cornell_lii": _extract_cornell_lii,
+    "text": _extract_text,
+    "pdf": _extract_pdf,
+}
+
+
+def _fetch_authoritative(entry: dict[str, Any]) -> dict[str, Any]:
+    """Fetch + extract one authoritative source. Returns a manifest record:
+        {filename, url, fetched_at, http_status, content_length, content_hash,
+         etag (if any), error (if any)}.
+    Writes the extracted text to cache/authoritative/<filename>.txt on success.
+    """
+    filename = entry["filename"]
+    url = entry["authoritative_url"]
+    fmt = entry.get("authoritative_format") or "html"
+    extractor_name = entry.get("extractor") or "html"
+    record: dict[str, Any] = {
+        "filename": filename,
+        "url": url,
+        "format": fmt,
+        "extractor": extractor_name,
+        "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "http_status": None,
+        "content_length": 0,
+        "content_hash": None,
+        "etag": None,
+        "error": None,
+    }
+    try:
+        accept = "application/pdf" if fmt == "pdf" else "text/html,application/xhtml+xml,*/*"
+        resp = _http_get(url, accept=accept)
+        record["http_status"] = resp.status_code
+        record["etag"] = resp.headers.get("ETag")
+        if resp.status_code != 200:
+            record["error"] = f"HTTP {resp.status_code}"
+            return record
+        extractor = _EXTRACTORS.get(extractor_name)
+        if extractor is None:
+            record["error"] = f"unknown extractor {extractor_name!r}"
+            return record
+        if fmt == "pdf":
+            text = extractor(resp.content)
+        elif fmt == "text":
+            text = extractor(resp.text)
+        else:
+            text = extractor(resp.text)
+    except Exception as e:  # noqa: BLE001 — refresh must never crash on one bad source
+        record["error"] = f"{type(e).__name__}: {e}"
+        return record
+
+    if not text or not text.strip():
+        record["error"] = "extractor returned empty text"
+        return record
+
+    record["content_length"] = len(text)
+    record["content_hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    _auth_text_path(filename).write_text(text, encoding="utf-8")
+    return record
+
+
+def _load_auth_text(filename: str) -> Optional[str]:
+    """Return the cached authoritative text for a corpus filename, or None."""
+    p = _auth_text_path(filename)
+    if not p.exists():
+        return None
+    try:
+        return p.read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+# --- subcommand: refresh-authoritative --------------------------------------
+
+def cmd_refresh_authoritative(args: argparse.Namespace) -> int:
+    """Fetch every file's authoritative URL, extract clean text, cache it, and
+    write a manifest. Files without an authoritative_url (intentionally:
+    internal docs) are skipped with a clear note."""
+    _ensure_dirs()
+    taxonomy = _load_taxonomy()
+    entries = _normalize_allowlist(taxonomy)
+    selected = set(args.only or [])
+    if selected:
+        entries = [e for e in entries if e["filename"] in selected]
+
+    manifest = _load_auth_manifest()
+    files_section: dict[str, Any] = manifest.setdefault("files", {})
+
+    fetched = skipped = failed = 0
+    print(f"Refreshing authoritative sources ({len(entries)} entries)…")
+    for entry in entries:
+        filename = entry["filename"]
+        url = entry.get("authoritative_url")
+        if not url:
+            note = entry.get("_note") or "no authoritative URL configured"
+            print(f"  - {filename:<48} skipped — {note[:80]}")
+            skipped += 1
+            continue
+        if not args.force and filename in files_section and files_section[filename].get("content_hash"):
+            existing_text = _load_auth_text(filename)
+            if existing_text is not None:
+                print(f"  ⤳ {filename:<48} cached ({files_section[filename].get('content_length', 0)} chars) — pass --force to re-fetch")
+                continue
+
+        record = _fetch_authoritative(entry)
+        files_section[filename] = record
+        if record["error"]:
+            print(f"  ✗ {filename:<48} {record['error']}")
+            failed += 1
+        else:
+            print(f"  ✓ {filename:<48} {record['content_length']:>7} chars  hash={record['content_hash'][:12]}")
+            fetched += 1
+        time.sleep(args.delay)
+
+    manifest["files"] = files_section
+    manifest["last_refreshed"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    _write_auth_manifest(manifest)
+    print()
+    print(f"Authoritative manifest: {AUTH_MANIFEST}")
+    print(f"  fetched: {fetched}   cached: {len(entries) - fetched - skipped - failed}   skipped: {skipped}   failed: {failed}")
+    return 1 if failed else 0
+
+
+# --- subcommand: verify-corpus ----------------------------------------------
+
+_MIRROR_ARTIFACT_PATTERNS = (
+    re.compile(r"^#{1,6}\s"),                    # markdown headers added by mirror
+    re.compile(r"^\*Extracted from:"),           # provenance line added by mirror
+    re.compile(r"^<!--\s*Page\s+\d+\s*-->$"),    # page-break markers from PDF extraction
+    re.compile(r"^<!--\s*end of page"),
+    re.compile(r"^---+$"),                        # horizontal rules
+    re.compile(r"^=+$"),
+    re.compile(r"^In this article$"),             # docs.github.com TOC label
+    re.compile(r"^\*?\(?\d+\)?\*?$"),             # footnote markers like "(1)" or "1."
+)
+
+
+def _is_mirror_artifact(line: str) -> bool:
+    line = line.strip()
+    if not line:
+        return True
+    return any(p.match(line) for p in _MIRROR_ARTIFACT_PATTERNS)
+
+
+def _drift_summary(corpus_text: str, auth_text: str) -> dict[str, Any]:
+    """Compare the corpus mirror against the authoritative source.
+
+    Comparison is done on `_normalize_for_match`-normalized text so that
+    cosmetic mirror reformatting (line wraps, smart quotes) doesn't register
+    as drift. Mirror-side wrapper artifacts (markdown headers added by the
+    mirror, PDF page-break markers, provenance lines like "*Extracted from:
+    ...*", footnote-marker-only lines) are excluded from the comparison —
+    they can't be drift because the authoritative source never had them.
+
+    Returns:
+      - in_sync: True iff every legally-meaningful normalized line in the
+        corpus appears in the authoritative text.
+      - corpus_lines: count of normalized non-empty corpus lines compared
+      - matched_lines, missing_count, missing_examples (first 5)
+      - artifact_lines: count of mirror artifacts excluded from comparison
+    """
+    auth_norm = _normalize_for_match(auth_text)
+    matched = 0
+    missing: list[str] = []
+    artifacts = 0
+    compared = 0
+    for raw_line in corpus_text.splitlines():
+        if _is_mirror_artifact(raw_line):
+            artifacts += 1
+            continue
+        ln = _normalize_for_match(raw_line)
+        if not ln:
+            continue
+        compared += 1
+        # Skip very short lines (likely "(a)" / "1." / numbered list markers
+        # that survived after mirror-artifact filtering).
+        if len(ln) < 12:
+            matched += 1
+            continue
+        if ln in auth_norm:
+            matched += 1
+        else:
+            missing.append(ln)
+    return {
+        "corpus_lines": compared,
+        "matched_lines": matched,
+        "missing_count": len(missing),
+        "missing_examples": missing[:5],
+        "artifact_lines_excluded": artifacts,
+        "in_sync": len(missing) == 0,
+    }
+
+
+def cmd_verify_corpus(args: argparse.Namespace) -> int:
+    """For each corpus file with an authoritative source, check whether the
+    mirror is still in sync. Emits a markdown report (or JSON) and exits 1 if
+    any drift was detected."""
+    _ensure_dirs()
+    taxonomy = _load_taxonomy()
+    entries = _normalize_allowlist(taxonomy)
+    if args.only:
+        entries = [e for e in entries if e["filename"] in set(args.only)]
+
+    manifest = _load_auth_manifest()
+    rows: list[dict[str, Any]] = []
+    drift_seen = False
+    for entry in entries:
+        filename = entry["filename"]
+        url = entry.get("authoritative_url")
+        row: dict[str, Any] = {
+            "filename": filename,
+            "url": url,
+            "status": None,
+            "detail": None,
+        }
+        if not url:
+            row["status"] = "no-auth-source"
+            row["detail"] = entry.get("_note") or "no authoritative URL configured (intentional for internal documents)"
+            rows.append(row)
+            continue
+
+        corpus_path = CORPUS_DIR / filename
+        auth_text = _load_auth_text(filename)
+        manifest_record = manifest.get("files", {}).get(filename) or {}
+        if auth_text is None:
+            row["status"] = "auth-not-fetched"
+            err = manifest_record.get("error")
+            row["detail"] = f"authoritative source not yet cached — run refresh-authoritative" + (f" (last error: {err})" if err else "")
+            drift_seen = True
+            rows.append(row)
+            continue
+        if not corpus_path.exists():
+            row["status"] = "corpus-missing"
+            row["detail"] = f"corpus mirror not present — run refresh-corpus"
+            drift_seen = True
+            rows.append(row)
+            continue
+        corpus_text = corpus_path.read_text(encoding="utf-8")
+        diff = _drift_summary(corpus_text, auth_text)
+        row["drift"] = diff
+        if diff["in_sync"]:
+            row["status"] = "in-sync"
+            row["detail"] = f"{diff['matched_lines']} / {diff['corpus_lines']} normalized lines match"
+        else:
+            row["status"] = "drift"
+            row["detail"] = (
+                f"{diff['missing_count']} normalized line(s) in mirror not present in authoritative source"
+            )
+            drift_seen = True
+        rows.append(row)
+
+    if args.json:
+        print(json.dumps({"rows": rows, "drift_detected": drift_seen}, indent=2))
+        return 1 if drift_seen else 0
+
+    print(f"# verify-corpus report ({len(rows)} files)\n")
+    for row in rows:
+        sym = {
+            "in-sync": "✓",
+            "drift": "✗",
+            "auth-not-fetched": "?",
+            "corpus-missing": "?",
+            "no-auth-source": "—",
+        }.get(row["status"], "?")
+        print(f"{sym} {row['filename']:<48} {row['status']:<18} {row['detail']}")
+        if row["status"] == "drift":
+            for ex in row.get("drift", {}).get("missing_examples", []):
+                print(f"     missing: {ex[:120]}{'…' if len(ex) > 120 else ''}")
+    print()
+    print(f"Authoritative manifest: {AUTH_MANIFEST}")
+    if drift_seen:
+        print("⚠ at least one file is out of sync with its authoritative source.")
+    else:
+        print("✓ every cached corpus file with an authoritative source is in sync.")
+    return 1 if drift_seen else 0
 
 
 # --- subcommand: list-corpus -------------------------------------------------
@@ -1267,10 +1771,16 @@ def _classify_ref_for_pressure_test(ref: str) -> str:
 def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
     """Resolve one source ref and (optionally) verify a quote against it.
 
+    Verification is *authoritative-first*: when the ref points to a corpus
+    file that has an authoritative public source cached locally (via
+    `refresh-authoritative`), the quote is verified against that source. The
+    cached corpus mirror is consulted only when no authoritative copy is
+    available.
+
     Returns a dict with: ref, classification, source_url, resolved (bool),
-    error (if any), quote_provided (bool), quote_verified (bool|None).
-    Catches *any* exception from the dispatcher so a single bad ref never
-    crashes the whole pressure-test run.
+    error (if any), quote_provided (bool), quote_verified (bool|None),
+    authoritative_url (str|None), authoritative_verified (bool|None),
+    verified_against ('authoritative' | 'mirror' | None).
     """
     out: dict[str, Any] = {
         "ref": ref,
@@ -1280,14 +1790,14 @@ def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
         "error": None,
         "quote_provided": bool(quote and quote.strip()),
         "quote_verified": None,
+        "authoritative_url": None,
+        "authoritative_verified": None,
+        "verified_against": None,
     }
     try:
         source = _resolve_source_text(ref)
     except Exception as e:  # noqa: BLE001 — pressure-test must never crash on a bad ref
         out["error"] = f"{type(e).__name__}: {e}"
-        # Heuristic: a github.com URL that returns 404 unauthenticated almost
-        # always means a private/internal GitHub resource. Surface that so the
-        # public-source check can downgrade it to "background only".
         msg = str(e).lower()
         if ref.startswith("https://github.com/") and ("404" in msg or "not found" in msg):
             out["classification"] = "github-internal"
@@ -1299,9 +1809,37 @@ def _check_one_quote(ref: str, quote: Optional[str]) -> dict[str, Any]:
     out["resolved"] = True
     out["source_url"] = source["source_url"]
     out["classification"] = source["classification"]
+
+    auth_text: Optional[str] = None
+    auth_meta: Optional[dict[str, Any]] = None
+    corpus_filename = ref.split("#", 1)[0] if not ref.startswith("http") and "::" not in ref else None
+    if corpus_filename:
+        auth_meta = _authoritative_meta_for(corpus_filename)
+        if auth_meta:
+            out["authoritative_url"] = auth_meta.get("authoritative_url")
+            auth_text = _load_auth_text(corpus_filename)
+
     if quote and quote.strip():
-        haystack = source["text"]
-        out["quote_verified"] = _normalize_for_match(quote) in _normalize_for_match(haystack)
+        q_norm = _normalize_for_match(quote)
+        mirror_match = q_norm in _normalize_for_match(source["text"])
+        if auth_text is not None:
+            auth_match = q_norm in _normalize_for_match(auth_text)
+            out["authoritative_verified"] = auth_match
+            out["quote_verified"] = auth_match
+            out["verified_against"] = "authoritative"
+            if not auth_match and mirror_match:
+                out["error"] = (
+                    "quote present in cached mirror but NOT in authoritative source — "
+                    "either the mirror has drifted or the quote was paraphrased"
+                )
+        else:
+            out["quote_verified"] = mirror_match
+            out["verified_against"] = "mirror"
+            if auth_meta and auth_meta.get("authoritative_url"):
+                out["error"] = (
+                    "verified against cached mirror only — authoritative source "
+                    "not yet fetched (run `cite.py refresh-authoritative`)"
+                )
     return out
 
 
@@ -1355,6 +1893,14 @@ def _grade_dimension(
     """Return (status, notes) for the legal or fact dimension.
 
     status ∈ {"pass", "warn", "fail"}.
+
+    Verification badges:
+      ✓✓  quote verified against the authoritative public source
+      ✓   quote verified against the cached mirror only (no auth source, or
+          auth source unreachable; this is the legitimate state for facts and
+          for github-public docs that are themselves the authoritative source)
+      ⚠   quote present in the mirror but NOT in the authoritative source
+          (corpus drift) — graded as warn, not fail, but flagged loudly
     """
     notes: list[str] = []
     if not spec:
@@ -1364,6 +1910,7 @@ def _grade_dimension(
     has_unresolved = False
     has_unverified = False
     has_no_quote = False
+    has_corpus_drift = False
     for r, s in zip(results, spec):
         label = s.get("label") or r["ref"]
         if not r["resolved"]:
@@ -1380,18 +1927,48 @@ def _grade_dimension(
             else:
                 notes.append(f"✓ {label} — ref resolves at {r['source_url']}")
             continue
+
+        verified_against = r.get("verified_against")
+        auth_url = r.get("authoritative_url")
         if r["quote_verified"]:
-            notes.append(f"✓ {label} — verbatim quote present in {r['source_url']}")
+            if verified_against == "authoritative":
+                notes.append(
+                    f"✓✓ {label} — verbatim quote verified against authoritative source ({auth_url})"
+                )
+            else:
+                # mirror-only verification
+                if auth_url:
+                    has_no_quote = True  # treat as warn so reviewer knows to refresh-authoritative
+                    notes.append(
+                        f"⚠ {label} — quote verified against cached mirror only; "
+                        f"authoritative source not yet fetched (run `cite.py refresh-authoritative`). "
+                        f"Source: {r['source_url']}"
+                    )
+                else:
+                    notes.append(
+                        f"✓ {label} — verbatim quote present in {r['source_url']} "
+                        f"(no authoritative source applies — this ref *is* the publisher copy)"
+                    )
         else:
-            has_unverified = True
-            notes.append(
-                f"✗ {label} — quote NOT found verbatim in source "
-                f"({r['source_url']}); reviewer may be paraphrasing or misciting"
-            )
+            # quote was not verified
+            if verified_against == "authoritative" and r.get("error", "").startswith("quote present in cached mirror"):
+                # corpus drift: mirror has it, authoritative doesn't
+                has_corpus_drift = True
+                notes.append(
+                    f"⚠ {label} — quote is in the cached mirror but NOT in the authoritative "
+                    f"source ({auth_url}). This is corpus drift: the mirror may be stale or the "
+                    f"quote may have been paraphrased. Run `cite.py verify-corpus` for details."
+                )
+            else:
+                has_unverified = True
+                notes.append(
+                    f"✗ {label} — quote NOT found verbatim in source "
+                    f"({r['source_url']}); reviewer may be paraphrasing or misciting"
+                )
 
     if has_unresolved or has_unverified:
         return "fail", notes
-    if has_no_quote:
+    if has_no_quote or has_corpus_drift:
         return "warn", notes
     return "pass", notes
 
@@ -1536,6 +2113,23 @@ def _build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("refresh-corpus", help="mirror the legal reference library into the local cache")
     sp.add_argument("--only", nargs="*", help="optional subset of filenames to refresh")
     sp.set_defaults(func=cmd_refresh_corpus)
+
+    sp = sub.add_parser(
+        "refresh-authoritative",
+        help="fetch the official public source for every cached file and store it for verification",
+    )
+    sp.add_argument("--only", nargs="*", help="optional subset of filenames to refresh")
+    sp.add_argument("--force", action="store_true", help="re-fetch even if a cached copy already exists")
+    sp.add_argument("--delay", type=float, default=1.0, help="seconds to sleep between requests (default: 1.0)")
+    sp.set_defaults(func=cmd_refresh_authoritative)
+
+    sp = sub.add_parser(
+        "verify-corpus",
+        help="diff every cached corpus file against its authoritative public source; exit 1 on drift",
+    )
+    sp.add_argument("--only", nargs="*", help="optional subset of filenames to check")
+    sp.add_argument("--json", action="store_true")
+    sp.set_defaults(func=cmd_verify_corpus)
 
     sp = sub.add_parser("list-corpus", help="show the current cache state")
     sp.add_argument("--file", help="show every section anchor in this cached file")

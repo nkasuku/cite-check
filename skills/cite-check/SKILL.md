@@ -98,18 +98,31 @@ Then build the local corpus from `github/ppl-legal-reference`:
 python3 <path-to>/cite.py refresh-corpus
 ```
 
-Re-run `refresh-corpus` whenever the user mentions that the reference library has been updated.
+Then fetch the **authoritative public source** (EUR-Lex, leginfo.legislature.ca.gov, gnu.org, docs.github.com, etc.) for every cached file that has one, so verification can run against the official publisher rather than the GitHub mirror:
+
+```bash
+python3 <path-to>/cite.py refresh-authoritative
+```
+
+Re-run both whenever the user mentions that the reference library has been updated, or whenever a regulation has been amended (e.g., a new SCC release, a docs.github.com Privacy Statement update). To detect mirror staleness on demand, run:
+
+```bash
+python3 <path-to>/cite.py verify-corpus
+```
+
+This diffs every cached corpus file against its authoritative source and reports drift (exit 1 if any file is out of sync).
 
 ## Hard rules (do not break)
 
 These rules implement the user's standing custom instructions. They are non-negotiable.
 
 1. **No fabricated citations.** Every quote that appears in a Citation Card must be byte-for-byte present in the cited source. Use `cite.py verify` on every quote before assembling the cards file. If verify returns exit code 2, you must either (a) replace the quote with one that does verify, or (b) drop the card.
-2. **Public-source-only legal basis.** The `LEGAL PROVISION` quote in any card must come from a source classified as `public-law`, `public-guidance`, or `github-public`. Sources classified as `github-internal` may appear *only* in an `INTERNAL CONTEXT — background only` quote inside a card, never as the legal basis. Use the classification field returned by `cite.py extract-source`.
-3. **`[VERIFY]` tagging for web fetches.** Anything pulled by `cite.py extract-source --ref <https-URL>` (rather than from the cached corpus) is auto-classified as `verify-required`. You must keep that classification through to the cards file so the rendered card carries the `[VERIFY]` tag.
-4. **Jurisdiction confirmation.** Before extracting any legal provisions, ask the user (use `ask_user`) which jurisdictions to analyze under. Default per the user's standing instructions: US federal + California. Always offer to add EU/UK if the product touches EU/UK users.
-5. **Never paraphrase inside a quote block.** Citation card quote blocks contain only verbatim text from the source. Analytical text (your interpretation, the nexus, the recommendation) lives in the `nexus` and `action` fields, never in `quote`.
-6. **No final legal advice.** The output document is always framed as a drafting aid. Do not change the disclaimer banner the build tool emits.
+2. **Authoritative-first verification for laws.** When a cited file has an `authoritative_url` configured in `taxonomy.json` (every public-law, public-guidance, open-source-license, and GitHub-public file does), pressure-test verifies the quote against that authoritative source — not against the cached mirror. The cached mirror is only the fallback when the authoritative source is unreachable. If `refresh-authoritative` has not been run for a file, pressure-test will WARN ("verified against cached mirror only — run refresh-authoritative") rather than silently passing on mirror-only verification.
+3. **Public-source-only legal basis.** The `LEGAL PROVISION` quote in any card must come from a source classified as `public-law`, `public-guidance`, or `github-public`. Sources classified as `github-internal` (which now includes `04-msft-*` Microsoft contractual instruments) may appear *only* in an `INTERNAL CONTEXT — background only` quote inside a card, never as the legal basis. Use the classification field returned by `cite.py extract-source`.
+4. **`[VERIFY]` tagging for web fetches.** Anything pulled by `cite.py extract-source --ref <https-URL>` (rather than from the cached corpus) is auto-classified as `verify-required`. You must keep that classification through to the cards file so the rendered card carries the `[VERIFY]` tag.
+5. **Jurisdiction confirmation.** Before extracting any legal provisions, ask the user (use `ask_user`) which jurisdictions to analyze under. Default per the user's standing instructions: US federal + California. Always offer to add EU/UK if the product touches EU/UK users.
+6. **Never paraphrase inside a quote block.** Citation card quote blocks contain only verbatim text from the source. Analytical text (your interpretation, the nexus, the recommendation) lives in the `nexus` and `action` fields, never in `quote`.
+7. **No final legal advice.** The output document is always framed as a drafting aid. Do not change the disclaimer banner the build tool emits.
 
 ## Workflow — Mode A (ORIGINATE)
 
@@ -360,12 +373,19 @@ Optional flags:
 
 Exit code: `0` = all PASS, `1` = at least one WARN, `2` = at least one FAIL.
 
+**Verification badges in the output:**
+- `✓✓` — quote was verified against the **authoritative public source** (e.g., EUR-Lex for EU regulations, leginfo.legislature.ca.gov for California codes, gnu.org for license text, docs.github.com for GitHub commitments). This is the strongest possible signal: the law as published by the legislature/regulator/standards body actually contains the quoted language.
+- `✓` — quote was verified against the cached mirror only. Two legitimate cases: (a) the source *is* the publisher copy (e.g., a GitHub issue/comment is the original; there's no upstream "authoritative" version), or (b) the file has no `authoritative_url` configured (intentional for internal documents).
+- `⚠` (mirror-only warn) — the file has an `authoritative_url` but `refresh-authoritative` hasn't been run for it yet. Tell the user: "Run `cite.py refresh-authoritative` to upgrade this from mirror-only to authoritative verification."
+- `⚠` (corpus drift) — the quote *is* in the cached mirror but is **NOT** in the authoritative source. This means the mirror is stale, the law has been amended, or the original transcription was wrong. Treat as a serious warning — recommend running `cite.py verify-corpus` to see all drift across the corpus, and `refresh-corpus` to update the mirror.
+- `✗` — quote not found anywhere (paraphrased, hallucinated, or wrong source).
+
 ### Step B4 — Surface the report inline
 
 The default output is markdown. Post the relevant sections inline in the conversation. For each risk:
 
-- **PASS** — say so in one line and move on
-- **WARN** — explain what the warning means (typically: a legal cite resolves but no verbatim quote was provided, OR a primary cite is `github-internal` and may only be background)
+- **PASS** — say so in one line and move on. If the legal anchor showed `✓✓`, mention that the quote is verified against the official publisher (it's a credibility multiplier).
+- **WARN** — explain what the warning means (typically: a legal cite resolves but no verbatim quote was provided, OR a primary cite is `github-internal` and may only be background, OR the authoritative source hasn't been fetched yet, OR the mirror has drifted from the authoritative source).
 - **FAIL** — be specific about which dimension failed and why. Common failures:
   - *Legal quote not verbatim:* the law doesn't actually say what the review claims it says. The reviewer needs to either find the right provision or rewrite the claim.
   - *Product fact not verbatim:* the issue/comment doesn't actually say what the review attributes to it. Possible hallucination or misattribution.
@@ -424,3 +444,6 @@ If the right provision is on a public regulator's site but not in the cache, and
 | `pressure-test` reports a ref as "could not resolve" with HTTPError 404 | The cited URL is private/internal (or genuinely missing); pressure-test auto-classifies it as `github-internal` | Tell the user the cite is private. Either find a public counterpart or move that source to background-only and rest the legal conclusion on a public cite. |
 | `pressure-test` reports `quote NOT found verbatim` on a product fact | The review attributes language to a comment/issue body that the source doesn't actually contain (paraphrase, hallucination, or wrong comment ID) | Re-extract the source with `extract-facts` and find the actual nearest verbatim span; either rewrite the claim to use real language or flag it for the reviewer's correction |
 | `pressure-test` reports `ref resolves but no verbatim quote provided` (warn) | The reviewer cited a provision generically without pinning specific language | Ask the user whether they want help finding the most relevant verbatim sub-clause from that provision, or whether the generic cite is acceptable |
+| `pressure-test` reports `quote verified against cached mirror only; authoritative source not yet fetched` (warn) | The corpus file has an `authoritative_url` configured but `refresh-authoritative` hasn't been run for it | Run `cite.py refresh-authoritative --only <filename>` to upgrade the verification from mirror-only to authoritative, then re-run pressure-test |
+| `pressure-test` reports `quote is in the cached mirror but NOT in the authoritative source` (corpus drift) | The mirror copy of the law/regulation has diverged from the official publisher (mirror is stale, the law was amended, or the original transcription was wrong) | Run `cite.py verify-corpus` to see all drift across the corpus. If the mirror is stale, run `cite.py refresh-corpus`. If the law was genuinely amended, update the cited language in the review to match the current authoritative version. |
+| `verify-corpus` flags drift on a file you didn't change | The authoritative public source has been updated since the mirror was built (e.g., docs.github.com Privacy Statement got a new effective date) | Run `cite.py refresh-corpus --only <filename>` to update the mirror; if the changes are substantive (e.g., a new SCC release, a regulation amendment), surface that as a finding to the reviewer because any prior reviews relying on the old text may need re-examination |

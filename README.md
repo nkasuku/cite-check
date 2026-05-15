@@ -38,6 +38,33 @@ You've already done the review. Now you want to be sure the citations actually h
 
 Use Mode B when you want to pressure-test before sending the review out. It catches paraphrased law, hallucinated product quotes, dead links, and reliance on internal-only sources.
 
+## Authoritative-source verification
+
+cite-check doesn't trust the cached mirror as the source of truth for the law. For every public-law, public-guidance, open-source-license, and GitHub public-commitment file in the corpus, `taxonomy.json` maps it to the **official publisher's URL**:
+
+- EU regulations (GDPR, EU AI Act, ePrivacy Directive, SCCs) → [EUR-Lex](https://eur-lex.europa.eu)
+- UK GDPR → [legislation.gov.uk](https://www.legislation.gov.uk)
+- CCPA → [leginfo.legislature.ca.gov](https://leginfo.legislature.ca.gov)
+- US Title 17 → [law.cornell.edu/uscode/text/17](https://www.law.cornell.edu/uscode/text/17)
+- Open source licenses → apache.org / gnu.org / opensource.org / spdx.org
+- EDPB / WP29 guidelines → edpb.europa.eu
+- FTC guidance → ftc.gov
+- NIST AI Framework → nist.gov
+- CJEU judgments (Schrems I & II) → curia.europa.eu
+- GitHub Terms / Privacy Statement / DPA → docs.github.com
+
+Run `cite.py refresh-authoritative` to fetch every authoritative source into `~/.copilot/skills/cite-check/cache/authoritative/`. Once cached, every quote verified by `pressure-test` is checked against the **authoritative copy** first, with the GitHub-mirror copy used only as a fallback when the official publisher is unreachable. Quotes verified against the authoritative source are tagged `✓✓` in the report; mirror-only verifications are tagged `✓` (or `⚠` if an authoritative source exists but hasn't been fetched yet).
+
+To check whether the cached mirror has drifted from the authoritative public source (e.g., a regulation was amended, the docs.github.com Privacy Statement got a new effective date), run:
+
+```bash
+python3 skills/cite-check/tools/cite.py verify-corpus
+```
+
+This diffs every file with an authoritative source against its publisher copy and reports drift. Exit 0 if every file is in sync, exit 1 otherwise.
+
+Internal documents (Microsoft DPA, internal playbooks, process docs) intentionally have no `authoritative_url` — they're correctly classified as `github-internal` and can only be used as background context, never as the basis for a legal conclusion.
+
 ## Why two anchors per risk?
 
 A product counsel reviewing AI-assisted output is the most hallucination-sensitive consumer in the building. There are two failure modes:
